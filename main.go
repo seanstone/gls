@@ -29,7 +29,7 @@ const (
 	colRed     = "31"   // untracked
 	colGreen   = "32"   // staged
 	colYellow  = "33"   // modified / deleted in worktree
-	colBlue    = "34"   // clean directory (ls-style)
+	colCyan    = "36"   // clean directory
 	colGray    = "90"   // ignored
 	colBoldRed = "1;31" // conflicted / unmerged
 	sgrStrike  = "9"    // struck through (deleted ghost rows)
@@ -238,12 +238,12 @@ func displayCode(code string) string {
 }
 
 // colorFor maps a porcelain status code to an ANSI color. Status wins over the
-// ls-style blue used for plain directories.
+// cyan used for plain (clean) directories.
 func colorFor(code string, isDir bool) string {
 	switch code {
 	case "":
 		if isDir {
-			return colBlue
+			return colCyan
 		}
 		return ""
 	case "??":
@@ -264,7 +264,7 @@ func colorFor(code string, isDir bool) string {
 		}
 	}
 	if isDir {
-		return colBlue
+		return colCyan
 	}
 	return ""
 }
