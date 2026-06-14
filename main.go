@@ -110,7 +110,8 @@ func run(dir string, long, all, useColor bool) error {
 }
 
 // collect builds the list of rows for a directory: every on-disk entry plus
-// ghost rows for paths git reports as deleted (gone from disk).
+// ghost rows for paths git reports as deleted (gone from disk). Statuses
+// deeper than a direct child roll up to the subdirectory that contains them.
 func collect(abs string, status map[string]string, all bool) ([]item, error) {
 	entries, err := os.ReadDir(abs)
 	if err != nil {
@@ -118,6 +119,26 @@ func collect(abs string, status map[string]string, all bool) ([]item, error) {
 	}
 
 	hidden := func(name string) bool { return !all && strings.HasPrefix(name, ".") }
+
+	// One pass over the status map partitions changes by top-level name:
+	// deeper paths roll up to their subdirectory; direct deletions (absent
+	// from disk) become ghost rows.
+	rollup := make(map[string]string) // subdir name -> highest-precedence descendant code
+	ghosts := make(map[string]string) // direct child name -> deletion code
+	prefix := abs + string(os.PathSeparator)
+	for key, code := range status {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rel := key[len(prefix):]
+		if i := strings.IndexByte(rel, filepath.Separator); i >= 0 {
+			if seg := rel[:i]; rank(code) > rank(rollup[seg]) {
+				rollup[seg] = code
+			}
+		} else if strings.ContainsRune(code, 'D') {
+			ghosts[rel] = code
+		}
+	}
 
 	items := make([]item, 0, len(entries))
 	seen := make(map[string]bool, len(entries))
@@ -128,31 +149,52 @@ func collect(abs string, status map[string]string, all bool) ([]item, error) {
 		}
 		seen[name] = true
 		fi, _ := e.Info()
-		items = append(items, item{
-			name:  name,
-			isDir: e.IsDir(),
-			info:  fi,
-			code:  status[filepath.Join(abs, name)],
-		})
+		code := status[filepath.Join(abs, name)]
+		if e.IsDir() && code == "" {
+			code = rollup[name] // "" when nothing rolled up
+		}
+		items = append(items, item{name: name, isDir: e.IsDir(), info: fi, code: code})
 	}
 
-	// Ghost rows: direct children git reports as deleted but absent from disk.
-	prefix := abs + string(os.PathSeparator)
-	for key, code := range status {
-		if !strings.HasPrefix(key, prefix) {
+	// Direct children git reports deleted but absent from disk.
+	for name, code := range ghosts {
+		if seen[name] || hidden(name) {
 			continue
 		}
-		rel := key[len(prefix):]
-		if strings.ContainsRune(rel, os.PathSeparator) {
-			continue // deeper than a direct child
-		}
-		if seen[rel] || hidden(rel) || !strings.ContainsRune(code, 'D') {
+		seen[name] = true
+		items = append(items, item{name: name, code: code, ghost: true})
+	}
+	// Whole subdirectories that vanished (every file under them deleted).
+	for name, code := range rollup {
+		if seen[name] || hidden(name) {
 			continue
 		}
-		seen[rel] = true
-		items = append(items, item{name: rel, code: code, ghost: true})
+		seen[name] = true
+		items = append(items, item{name: name, isDir: true, code: code, ghost: true})
 	}
 	return items, nil
+}
+
+// rank orders status codes for directory rollup; higher wins. Clean and
+// ignored contribute nothing, so they never recolor a tracked directory.
+func rank(code string) int {
+	switch code {
+	case "", "!!":
+		return 0
+	case "UU":
+		return 5
+	case "??":
+		return 2
+	}
+	if len(code) >= 2 {
+		if code[1] != '.' && code[1] != ' ' {
+			return 4 // unstaged worktree change
+		}
+		if code[0] != '.' && code[0] != ' ' {
+			return 3 // staged
+		}
+	}
+	return 0
 }
 
 func printItem(it item, long, useColor bool) {
