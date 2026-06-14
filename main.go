@@ -50,15 +50,16 @@ func main() {
 	var (
 		long      = flag.Bool("l", false, "long format: status, mode, size, mtime, name")
 		all       = flag.Bool("a", false, "include entries starting with '.'")
+		human     = flag.Bool("h", false, "with -l, print human-readable sizes (e.g. 2.1K)")
 		one       = flag.Bool("1", false, "force one entry per line")
 		cols      = flag.Bool("C", false, "force multi-column (grid) output")
 		colorWhen = flag.String("color", "auto", "colorize output: auto, always, or never")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: gls [-l] [-a] [-1] [-C] [--color=auto|always|never] [path]\n")
+		fmt.Fprintf(os.Stderr, "usage: gls [-l] [-h] [-a] [-1] [-C] [--color=auto|always|never] [path]\n")
 		flag.PrintDefaults()
 	}
-	flag.Parse()
+	flag.CommandLine.Parse(expandShortFlags(os.Args[1:]))
 
 	dir := "."
 	if flag.NArg() > 0 {
@@ -69,13 +70,44 @@ func main() {
 	// Grid is the compact default on a terminal; line modes stay script-friendly.
 	grid := !*long && !*one && (*cols || stdoutIsTTY())
 
-	if err := run(dir, *long, *all, grid, useColor); err != nil {
+	if err := run(dir, *long, *human, *all, grid, useColor); err != nil {
 		fmt.Fprintln(os.Stderr, "gls:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dir string, long, all, grid, useColor bool) error {
+// expandShortFlags lets bundled single-char boolean flags work like ls, e.g.
+// `-lh` becomes `-l -h`. A cluster is expanded only when every character is a
+// known boolean flag, so long flags (`-color`, `--color=never`) pass through.
+func expandShortFlags(args []string) []string {
+	const known = "lha1C"
+	out := make([]string, 0, len(args))
+	for i, a := range args {
+		if a == "--" { // flag terminator: leave the rest untouched
+			out = append(out, args[i:]...)
+			break
+		}
+		if len(a) > 2 && a[0] == '-' && a[1] != '-' && allIn(a[1:], known) {
+			for _, c := range a[1:] {
+				out = append(out, "-"+string(c))
+			}
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func allIn(s, set string) bool {
+	for _, c := range s {
+		if !strings.ContainsRune(set, c) {
+			return false
+		}
+	}
+	return true
+}
+
+func run(dir string, long, human, all, grid, useColor bool) error {
 	// Canonicalize so paths line up with git's (symlink-resolved) output.
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -99,7 +131,7 @@ func run(dir string, long, all, grid, useColor bool) error {
 			isDir: false,
 			info:  info,
 			code:  status[abs],
-		}, long, useColor)
+		}, long, human, useColor)
 		return nil
 	}
 
@@ -114,7 +146,7 @@ func run(dir string, long, all, grid, useColor bool) error {
 		return nil
 	}
 	for _, it := range items {
-		printItem(it, long, useColor)
+		printItem(it, long, human, useColor)
 	}
 	return nil
 }
@@ -207,7 +239,7 @@ func rank(code string) int {
 	return 0
 }
 
-func printItem(it item, long, useColor bool) {
+func printItem(it item, long, human, useColor bool) {
 	name := it.name
 	if it.isDir {
 		name += "/"
@@ -219,13 +251,39 @@ func printItem(it item, long, useColor bool) {
 		return
 	}
 
-	mode, size, mtime := "----------", int64(0), ""
+	mode, size, mtime := "----------", "0", ""
 	if it.info != nil {
 		mode = it.info.Mode().String()
-		size = it.info.Size()
 		mtime = it.info.ModTime().Format("Jan _2 15:04")
+		if human {
+			size = humanSize(it.info.Size())
+		} else {
+			size = strconv.FormatInt(it.info.Size(), 10)
+		}
 	}
-	fmt.Printf("%s %s %9d %12s %s\n", displayCode(it.code), mode, size, mtime, name)
+	fmt.Printf("%s %s %9s %12s %s\n", displayCode(it.code), mode, size, mtime, name)
+}
+
+// humanSize formats a byte count the way `ls -h` does: 1024-based units with a
+// single-letter suffix, one decimal place below 10, none at or above.
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return strconv.FormatInt(n, 10)
+	}
+	val := float64(n)
+	i := -1
+	for _, suffix := range []string{"K", "M", "G", "T", "P", "E"} {
+		val /= unit
+		i++
+		if val < unit {
+			if val < 10 {
+				return fmt.Sprintf("%.1f%s", val, suffix)
+			}
+			return fmt.Sprintf("%.0f%s", val, suffix)
+		}
+	}
+	return fmt.Sprintf("%.0fE", val) // n is int64; never reaches here in practice
 }
 
 // displayCode renders the 2-char status column the way `git status -s` does,
