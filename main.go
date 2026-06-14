@@ -6,8 +6,8 @@
 //	git status --porcelain=v2 --ignored -z
 //
 // which reports every non-clean path (untracked, ignored, staged, modified,
-// conflicted) in one machine-readable pass. Anything not reported is clean.
-// We map those paths onto the directory entries and pick an ANSI color.
+// deleted, conflicted) in one machine-readable pass. Anything not reported is
+// clean. We map those paths onto the directory entries and pick an ANSI color.
 package main
 
 import (
@@ -23,19 +23,31 @@ import (
 
 // ANSI SGR color codes.
 const (
-	colReset    = "\x1b[0m"
-	colRed      = "31"   // untracked
-	colGreen    = "32"   // staged
-	colYellow   = "33"   // modified in worktree
-	colBlue     = "34"   // clean directory (ls-style)
-	colGray     = "90"   // ignored
-	colBoldRed  = "1;31" // conflicted / unmerged
+	colReset   = "\x1b[0m"
+	colRed     = "31"   // untracked
+	colGreen   = "32"   // staged
+	colYellow  = "33"   // modified / deleted in worktree
+	colBlue    = "34"   // clean directory (ls-style)
+	colGray    = "90"   // ignored
+	colBoldRed = "1;31" // conflicted / unmerged
+	sgrStrike  = "9"    // struck through (deleted ghost rows)
 )
+
+// item is one row in the listing. It represents either a real directory entry
+// or a synthesized "ghost" — a path git reports (e.g. a deletion) that no
+// longer exists on disk, so os.ReadDir never returns it.
+type item struct {
+	name  string
+	isDir bool
+	info  fs.FileInfo // nil for ghosts
+	code  string      // 2-char git status code, "" when clean
+	ghost bool        // not present on disk
+}
 
 func main() {
 	var (
-		long    = flag.Bool("l", false, "long format: status, mode, size, mtime, name")
-		all     = flag.Bool("a", false, "include entries starting with '.'")
+		long      = flag.Bool("l", false, "long format: status, mode, size, mtime, name")
+		all       = flag.Bool("a", false, "include entries starting with '.'")
 		colorWhen = flag.String("color", "auto", "colorize output: auto, always, or never")
 	)
 	flag.Usage = func() {
@@ -76,53 +88,92 @@ func run(dir string, long, all, useColor bool) error {
 
 	// A single non-directory argument: just print that one entry.
 	if !info.IsDir() {
-		printEntry(filepath.Dir(abs), fs.FileInfoToDirEntry(info), status, long, useColor)
+		printItem(item{
+			name:  info.Name(),
+			isDir: false,
+			info:  info,
+			code:  status[abs],
+		}, long, useColor)
 		return nil
 	}
 
-	entries, err := os.ReadDir(abs)
+	items, err := collect(abs, status, all)
 	if err != nil {
 		return err
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
+	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
 
-	for _, e := range entries {
-		if !all && strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		printEntry(abs, e, status, long, useColor)
+	for _, it := range items {
+		printItem(it, long, useColor)
 	}
 	return nil
 }
 
-func printEntry(dir string, e fs.DirEntry, status map[string]string, long, useColor bool) {
-	full := filepath.Join(dir, e.Name())
-	code := status[full] // "" when clean or not in a repo
+// collect builds the list of rows for a directory: every on-disk entry plus
+// ghost rows for paths git reports as deleted (gone from disk).
+func collect(abs string, status map[string]string, all bool) ([]item, error) {
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return nil, err
+	}
 
-	name := e.Name()
-	if e.IsDir() {
+	hidden := func(name string) bool { return !all && strings.HasPrefix(name, ".") }
+
+	items := make([]item, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if hidden(name) {
+			continue
+		}
+		seen[name] = true
+		fi, _ := e.Info()
+		items = append(items, item{
+			name:  name,
+			isDir: e.IsDir(),
+			info:  fi,
+			code:  status[filepath.Join(abs, name)],
+		})
+	}
+
+	// Ghost rows: direct children git reports as deleted but absent from disk.
+	prefix := abs + string(os.PathSeparator)
+	for key, code := range status {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rel := key[len(prefix):]
+		if strings.ContainsRune(rel, os.PathSeparator) {
+			continue // deeper than a direct child
+		}
+		if seen[rel] || hidden(rel) || !strings.ContainsRune(code, 'D') {
+			continue
+		}
+		seen[rel] = true
+		items = append(items, item{name: rel, code: code, ghost: true})
+	}
+	return items, nil
+}
+
+func printItem(it item, long, useColor bool) {
+	name := it.name
+	if it.isDir {
 		name += "/"
 	}
-	name = colorize(name, colorFor(code, e.IsDir()), useColor)
+	name = render(name, colorFor(it.code, it.isDir), it.ghost, useColor)
 
 	if !long {
-		fmt.Printf("%s %s\n", displayCode(code), name)
+		fmt.Printf("%s %s\n", displayCode(it.code), name)
 		return
 	}
 
-	var (
-		mode  = "?---------"
-		size  int64
-		mtime = ""
-	)
-	if fi, err := e.Info(); err == nil {
-		mode = fi.Mode().String()
-		size = fi.Size()
-		mtime = fi.ModTime().Format("Jan _2 15:04")
+	mode, size, mtime := "----------", int64(0), ""
+	if it.info != nil {
+		mode = it.info.Mode().String()
+		size = it.info.Size()
+		mtime = it.info.ModTime().Format("Jan _2 15:04")
 	}
-	fmt.Printf("%s %s %9d %s %s\n", displayCode(code), mode, size, mtime, name)
+	fmt.Printf("%s %s %9d %12s %s\n", displayCode(it.code), mode, size, mtime, name)
 }
 
 // displayCode renders the 2-char status column the way `git status -s` does,
@@ -151,12 +202,14 @@ func colorFor(code string, isDir bool) string {
 		return colBoldRed
 	}
 	// Ordinary/renamed entry: XY where X=index (staged), Y=worktree.
-	x, y := code[0], code[1]
-	if y != '.' && y != ' ' {
-		return colYellow // unstaged worktree change outstanding
-	}
-	if x != '.' && x != ' ' {
-		return colGreen // staged, nothing unstaged
+	if len(code) >= 2 {
+		x, y := code[0], code[1]
+		if y != '.' && y != ' ' {
+			return colYellow // unstaged worktree change (incl. deletion) outstanding
+		}
+		if x != '.' && x != ' ' {
+			return colGreen // staged, nothing unstaged
+		}
 	}
 	if isDir {
 		return colBlue
@@ -164,11 +217,26 @@ func colorFor(code string, isDir bool) string {
 	return ""
 }
 
-func colorize(s, col string, useColor bool) string {
-	if !useColor || col == "" {
+// render wraps a name in ANSI attributes: an optional color plus strikethrough
+// for ghost (deleted) rows. A no-op when color is disabled.
+func render(s, col string, strike, useColor bool) string {
+	if !useColor {
 		return s
 	}
-	return "\x1b[" + col + "m" + s + colReset
+	var sgr string
+	if strike {
+		sgr = sgrStrike
+	}
+	if col != "" {
+		if sgr != "" {
+			sgr += ";"
+		}
+		sgr += col
+	}
+	if sgr == "" {
+		return s
+	}
+	return "\x1b[" + sgr + "m" + s + colReset
 }
 
 // gitStatusMap returns a map of absolute path -> 2-char status code for every
