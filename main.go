@@ -18,7 +18,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ANSI SGR color codes.
@@ -48,10 +50,12 @@ func main() {
 	var (
 		long      = flag.Bool("l", false, "long format: status, mode, size, mtime, name")
 		all       = flag.Bool("a", false, "include entries starting with '.'")
+		one       = flag.Bool("1", false, "force one entry per line")
+		cols      = flag.Bool("C", false, "force multi-column (grid) output")
 		colorWhen = flag.String("color", "auto", "colorize output: auto, always, or never")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: gls [-l] [-a] [--color=auto|always|never] [path]\n")
+		fmt.Fprintf(os.Stderr, "usage: gls [-l] [-a] [-1] [-C] [--color=auto|always|never] [path]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -62,14 +66,16 @@ func main() {
 	}
 
 	useColor := decideColor(*colorWhen)
+	// Grid is the compact default on a terminal; line modes stay script-friendly.
+	grid := !*long && !*one && (*cols || stdoutIsTTY())
 
-	if err := run(dir, *long, *all, useColor); err != nil {
+	if err := run(dir, *long, *all, grid, useColor); err != nil {
 		fmt.Fprintln(os.Stderr, "gls:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dir string, long, all, useColor bool) error {
+func run(dir string, long, all, grid, useColor bool) error {
 	// Canonicalize so paths line up with git's (symlink-resolved) output.
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -103,6 +109,10 @@ func run(dir string, long, all, useColor bool) error {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
 
+	if grid {
+		printGrid(items, useColor)
+		return nil
+	}
 	for _, it := range items {
 		printItem(it, long, useColor)
 	}
@@ -349,10 +359,107 @@ func decideColor(when string) bool {
 	case "never":
 		return false
 	default: // auto
-		if os.Getenv("NO_COLOR") != "" {
-			return false
-		}
-		fi, err := os.Stdout.Stat()
-		return err == nil && fi.Mode()&os.ModeCharDevice != 0
+		return os.Getenv("NO_COLOR") == "" && stdoutIsTTY()
 	}
+}
+
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// printGrid lays the names out in column-major order, like `ls`: entries run
+// down each column then across, packed into as many columns as the terminal
+// width allows. Only names (colored, with a trailing slash for dirs) appear —
+// status is conveyed by color, keeping the grid compact.
+func printGrid(items []item, useColor bool) {
+	if len(items) == 0 {
+		return
+	}
+	n := len(items)
+	plain := make([]int, n)    // display width of each cell
+	colored := make([]string, n)
+	for i, it := range items {
+		name := it.name
+		if it.isDir {
+			name += "/"
+		}
+		plain[i] = utf8.RuneCountInString(name)
+		colored[i] = render(name, colorFor(it.code, it.isDir), it.ghost, useColor)
+	}
+
+	const gap = 2
+	width := termWidth()
+
+	// Pick the largest column count whose packed layout fits the width.
+	cols, rows, colw := 1, n, []int{maxWidth(plain)}
+	for c := min(n, width); c >= 1; c-- {
+		r := (n + c - 1) / c
+		w := make([]int, c)
+		total := 0
+		for j := 0; j < c; j++ {
+			for k := j * r; k < (j+1)*r && k < n; k++ {
+				if plain[k] > w[j] {
+					w[j] = plain[k]
+				}
+			}
+			total += w[j]
+			if j > 0 {
+				total += gap
+			}
+		}
+		if total <= width {
+			cols, rows, colw = c, r, w
+			break
+		}
+	}
+
+	var b strings.Builder
+	for r := 0; r < rows; r++ {
+		for j := 0; j < cols; j++ {
+			idx := j*rows + r
+			if idx >= n {
+				continue
+			}
+			b.WriteString(colored[idx])
+			if idx+rows < n { // another cell follows to the right
+				b.WriteString(strings.Repeat(" ", colw[j]-plain[idx]+gap))
+			}
+		}
+		b.WriteByte('\n')
+	}
+	fmt.Print(b.String())
+}
+
+func maxWidth(ws []int) int {
+	m := 0
+	for _, w := range ws {
+		if w > m {
+			m = w
+		}
+	}
+	return m
+}
+
+// termWidth returns the terminal column count, preferring $COLUMNS and falling
+// back to `stty size` on the controlling terminal, then to 80.
+func termWidth() int {
+	if c := strings.TrimSpace(os.Getenv("COLUMNS")); c != "" {
+		if n, err := strconv.Atoi(c); err == nil && n > 0 {
+			return n
+		}
+	}
+	if tty, err := os.Open("/dev/tty"); err == nil {
+		defer tty.Close()
+		cmd := exec.Command("stty", "size")
+		cmd.Stdin = tty
+		if out, err := cmd.Output(); err == nil {
+			if f := strings.Fields(string(out)); len(f) == 2 {
+				if n, err := strconv.Atoi(f[1]); err == nil && n > 0 {
+					return n
+				}
+			}
+		}
+	}
+	return 80
 }
